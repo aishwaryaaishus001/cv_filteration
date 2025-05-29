@@ -1,0 +1,855 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from final_ranking import extract_text_from_db
+from ranking1 import match_and_rank_resumes, calculate_rank
+from jd_generator1 import main_gpt
+from pdf_extract import main_doc
+import mysql.connector
+import os
+import json
+import ast
+import json
+from flask import jsonify, request
+
+app = Flask(__name__)
+CORS(app)
+
+# Global storage for result
+last_result = None
+
+# 🔹 Parse stringified lists/dictionaries safely
+def safe_parse(value):
+    try:
+        return ast.literal_eval(value) if isinstance(value, str) else value
+    except:
+        return []
+    
+
+# Set uploads folder relative to this file (inside back_end/uploads)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # path to back_end folder
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Database connection
+db = mysql.connector.connect(
+    host="localhost",
+    port=3308,
+    user="root",
+    password="CVanalysis@123",
+    database="resumes"
+)
+
+
+@app.route('/prompt', methods=['POST'])
+def receive_data():
+    global last_result
+    data = request.get_json()
+    prompt_text = data.get('prompt')
+    incoming_project_id = data.get('project_id')
+
+    if not incoming_project_id:
+        return jsonify({"error": "project_id is missing"}), 400
+
+    cursor = db.cursor()
+    try:
+
+        cursor.execute("INSERT INTO prompt (prompt_text, project_id) VALUES (%s, %s)", (prompt_text, int(incoming_project_id)))
+        db.commit() 
+        prompt_id = cursor.lastrowid
+        
+
+        cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (incoming_project_id,))
+        result = cursor.fetchone()
+        if not result:
+            return jsonify({"error": "Project ID not found"}), 404
+        folder_id = result[0]
+
+    except Exception as e:
+        print(f"❌ DB operation failed: {e}")
+        return jsonify({"error": "Database error"}), 500
+    finally:
+        cursor.close()
+
+    try:
+        last_result = main_gpt(prompt_text, folder_id)
+    except Exception as e:
+        return jsonify({"error": "GPT processing failed"}), 500
+
+    return jsonify({"message": "Prompt processed successfully", "result": last_result, "prompt_id": prompt_id}), 200
+
+
+
+   
+
+
+
+@app.route('/send-data', methods=['POST'])
+def received_data():
+    data = request.get_json()
+    
+    incoming_criteria = data.get('Json')  # Extract the JSON criteria data
+    incoming_project_id = data.get('projectId')  # Extract the projectId
+    incoming_prompt_id = data.get('promptId')  # Extract the projectId
+
+    print("Received Data:", incoming_criteria)
+    print("Received Project ID:", incoming_project_id)
+
+    # You can preprocess incoming_criteria here if needed
+    # For example, convert it to a string or clean it:
+    last_result = json.dumps(incoming_criteria)  # If it's a dictionary or list
+
+    cursor = db.cursor()
+    try:
+        
+        # Fetch folder_id for the project
+        cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (incoming_project_id,))
+        folder_result = cursor.fetchone()
+        if not folder_result:
+            return jsonify({"error": "Invalid project_id"}), 404
+        folder_id = folder_result[0]
+
+        # Get folder_name from folder_id
+        cursor.execute("SELECT folder_name FROM resume_folder WHERE folder_id = %s", (folder_id,))
+        folder_name_result = cursor.fetchone()
+        if not folder_name_result:
+            return jsonify({"error": "Invalid folder_id"}), 404
+        folder_name = folder_name_result[0]
+
+        # Parse criteria JSON to dict
+        keyword_dict = incoming_criteria
+
+        # Call extract_text_from_db to get updated ranked results
+        ranked_results = extract_text_from_db(int(incoming_project_id), folder_id, keyword_dict)
+
+
+        
+        if not ranked_results:
+            return jsonify({"error": "No ranked results found. Make sure resumes and criteria exist."}), 500
+
+        filtered_results = []
+
+        for item in ranked_results:
+            source_file = item['source_file']
+            folder_path = os.path.join(UPLOAD_FOLDER, folder_name)
+
+            # Create the relative path to the PDF (convert to URL-style path with forward slashes)
+            relative_path = os.path.join(folder_name, source_file).replace(os.sep, '/')
+
+            # Final URL that your frontend (or user) can open
+            pdf_path = f"http://localhost:5001/uploads/{relative_path}"
+
+            # Add this URL to the item dictionary
+            item['file_path'] = pdf_path
+
+            filtered_results.append(item)
+
+        print("Filtered Results:", filtered_results)
+
+
+        # Insert each record
+        for candidate in filtered_results:
+            data = candidate['result']
+            cursor.execute("""
+                INSERT INTO ranked_resumes (
+                    project_id, 
+                    prompt_id,
+                    name, 
+                    source_file,
+                    skills_score, 
+                    skills_matches,
+                    education_score, 
+                    education_matches,
+                    projects_score, 
+                    projects_matches,
+                    experience_score, 
+                    experience_matches,
+                    certifications_score, 
+                    certifications_matches,
+                    total_score, 
+                    summary, 
+                    file_path
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                int(incoming_project_id),   
+                int(incoming_prompt_id),  
+                candidate['name'],                        
+                candidate['source_file'],                 
+                data['Skills']['Score'],                 
+                json.dumps(data['Skills']['Matches']),   
+                data['Education']['Score'],               
+                json.dumps(data['Education']['Matches']),
+                data['Projects']['Score'],               
+                json.dumps(data['Projects']['Matches']), 
+                data['Experience']['Score'],              
+                json.dumps(data['Experience']['Matches']),
+                data['Certifications']['Score'],          
+                json.dumps(data['Certifications']['Matches']),
+                data['TotalScore'],                       
+                candidate['summary'],                     
+                candidate['file_path']                    
+            ))
+
+
+        db.commit()
+
+        print(f"✅ Successfully inserted {len(filtered_results)} ranked results for project_id {incoming_project_id}.")
+
+
+        # Return ranked results in response
+        return jsonify({"message": "Criteria updated and matches found", "ranked_results": filtered_results}), 200
+
+    except Exception as e:
+        print(f"❌ DB operation failed for project_id {incoming_project_id}: {e}")
+        return jsonify({"error": "DB operation failed"}), 500
+    finally:
+        cursor.close()
+
+
+
+@app.route('/send-pdf', methods=['POST'])
+def upload_pdfs():
+
+    cursor = db.cursor()
+    try:
+        pdfs = request.files.getlist('pdfs')
+        project_title = request.form.get('projectTitle')
+
+        if not pdfs:
+            return jsonify({"error": "No PDF files received."}), 400
+        if not project_title:
+            return jsonify({"error": "Project title is required."}), 400
+
+        first_file = pdfs[0]
+        relative_path = first_file.filename.replace("\\", "/")
+        folder_name = relative_path.split('/')[0]
+        root_folder = os.path.join(UPLOAD_FOLDER, folder_name)
+        saved_files = []
+
+        # ✅ Always ensure folder is in the database
+        cursor.execute("SELECT folder_id FROM resume_folder WHERE folder_name = %s", (folder_name,))
+        folder_result = cursor.fetchone()
+
+        if folder_result:
+            folder_id = folder_result[0]
+        else:
+            cursor.execute("INSERT INTO resume_folder (folder_name) VALUES (%s)", (folder_name,))
+            db.commit()
+            folder_id = cursor.lastrowid
+
+        # ✅ Save PDFs (only if they aren't already saved)
+        if not os.path.exists(root_folder):
+            for file in pdfs:
+                if file.filename.endswith('.pdf'):
+                    relative_path = file.filename.replace("\\", "/")
+                    save_path = os.path.join(UPLOAD_FOLDER, relative_path)
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    file.save(save_path)
+                    saved_files.append(relative_path)
+
+            # Check if project_folder entry already exists for folder_id and project_title
+            cursor.execute("SELECT project_id FROM project_folder WHERE folder_id = %s AND project_title = %s", (folder_id, project_title))
+            existing_project = cursor.fetchone()
+            if existing_project:
+                project_id = existing_project[0]
+            else:
+                # Insert new project_folder entry
+                cursor.execute("INSERT INTO project_folder (project_title, folder_id) VALUES (%s, %s)", (project_title, folder_id))
+                db.commit()
+                project_id = cursor.lastrowid
+
+            # ✅ Run resume parser
+            print("[INFO] Running main_doc...")
+            main_doc(root_folder, folder_id)
+            print("[INFO] main_doc completed.")
+            
+        else:
+            print(f"[INFO] Root folder already exists: {root_folder}")
+
+            # Check if project_folder entry already exists for folder_id and project_title
+            cursor.execute("SELECT project_id FROM project_folder WHERE folder_id = %s AND project_title = %s", (folder_id, project_title))
+            existing_project = cursor.fetchone()
+            if existing_project:
+                project_id = existing_project[0]
+            else:
+                # Insert new project_folder entry
+                cursor.execute("INSERT INTO project_folder (project_title, folder_id) VALUES (%s, %s)", (project_title, folder_id))
+                db.commit()
+                project_id = cursor.lastrowid
+
+
+            for file in pdfs:
+                if file.filename.endswith('.pdf'):
+                    relative_path = file.filename.replace("\\", "/")
+                    saved_files.append(relative_path)
+
+        return jsonify({
+            "message": f"Received {len(saved_files)} PDFs for project '{project_title}'",
+            "saved_files": saved_files,
+            "project_id": project_id
+        }), 200
+
+    except mysql.connector.IntegrityError as err:
+        if err.errno == mysql.connector.errorcode.ER_DUP_ENTRY:
+            return jsonify({"error": f"Project title '{project_title}' already exists."}), 409
+        else:
+            print(f"Database IntegrityError: {err}")
+            return jsonify({"error": "Database error."}), 500
+    except Exception as e:
+        print(f"Unexpected Error: {e}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    finally:
+        cursor.close()
+
+
+
+
+
+ranked_results_cache = []  # Store ranked results globally for later explanation
+
+
+@app.route('/rank-resumes', methods=['GET'])
+def rank_resumes():
+    project_id = request.args.get('project_id')
+    if not project_id:
+        return jsonify({"error": "Missing project_id"}), 400
+
+    try:
+        project_id = int(project_id)
+    except ValueError:
+        return jsonify({"error": "Invalid project_id (must be an integer)"}), 400
+
+    cursor = db.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT name, source_file,
+                   skills_score, skills_matches,
+                   education_score, education_matches,
+                   projects_score, projects_matches,
+                   experience_score, experience_matches,
+                   certifications_score, certifications_matches,
+                   total_score, summary, file_path
+            FROM ranked_resumes
+            WHERE project_id = %s
+        """, (project_id,))
+        
+        rows = cursor.fetchall()
+        if not rows:
+            return jsonify({"error": "No ranked resumes found for this project_id."}), 404
+
+        ranked_results = []
+        for row in rows:
+            ranked_results.append({
+                "name": row['name'],
+                "source_file": row['source_file'],
+                "result": {
+                    "Skills": {
+                        "Score": row['skills_score'],
+                        "Matches": json.loads(row['skills_matches'])
+                    },
+                    "Education": {
+                        "Score": row['education_score'],
+                        "Matches": json.loads(row['education_matches'])
+                    },
+                    "Projects": {
+                        "Score": row['projects_score'],
+                        "Matches": json.loads(row['projects_matches'])
+                    },
+                    "Experience": {
+                        "Score": row['experience_score'],
+                        "Matches": json.loads(row['experience_matches'])
+                    },
+                    "Certifications": {
+                        "Score": row['certifications_score'],
+                        "Matches": json.loads(row['certifications_matches'])
+                    },
+                    "TotalScore": row['total_score']
+                },
+                "summary": row['summary'],
+                "file_path": row['file_path']
+            })
+
+        return jsonify({"ranked": ranked_results}), 200
+
+    finally:
+        cursor.close()
+
+
+
+
+
+@app.route('/list-pdfs', methods=['GET'])
+def list_pdfs_by_folder():
+    Project_id = request.args.get('Project_id')  # Get project_id from query param
+
+    if not Project_id:
+        return jsonify({"error": "Missing Project_id parameter"}), 400
+
+    cursor = db.cursor()
+    try:
+        # Step 1: Get folder_id from project_id
+        cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (Project_id,))
+        folder_result = cursor.fetchone()
+        if not folder_result:
+            return jsonify({"error": "Invalid Project_id"}), 404
+        folder_id = folder_result[0]
+
+        # Step 2: Get folder_name from folder_id
+        cursor.execute("SELECT folder_name FROM resume_folder WHERE folder_id = %s", (folder_id,))
+        folder_result = cursor.fetchone()
+        if not folder_result:
+            return jsonify({"error": "Folder not found for given project"}), 404
+        folder_name = folder_result[0]
+    finally:
+        cursor.close()
+
+    # Step 3: Build path and list PDFs
+    folder_path = os.path.join(UPLOAD_FOLDER, folder_name)
+    if not os.path.exists(folder_path):
+        return jsonify({"error": f"Folder '{folder_name}' not found"}), 404
+
+    pdf_files = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith('.pdf'):
+                relative_path = os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER)
+                file_url = f"http://localhost:5001/uploads/{relative_path.replace(os.sep, '/')}"
+                pdf_files.append(file_url)
+
+    return jsonify({"pdfs": pdf_files}), 200
+
+
+
+
+@app.route('/uploads/<path:filename>')
+def serve_uploaded_file(filename):
+    safe_filename = os.path.normpath(filename)
+
+    # Split the filename into directory + file
+    directory = os.path.join(UPLOAD_FOLDER, os.path.dirname(safe_filename))
+    filename_only = os.path.basename(safe_filename)
+
+    full_path = os.path.join(directory, filename_only)
+    print(f"Requested filename: {filename}")
+    print(f"Normalized filename: {safe_filename}")
+    print(f"Serving from directory: {directory}")
+    print(f"File only: {filename_only}")
+    print(f"Full path on server: {full_path}")
+    print(f"File exists? {os.path.exists(full_path)}")
+
+    if not os.path.exists(full_path):
+        return jsonify({"error": "File not found on server"}), 404
+
+    return send_from_directory(directory, filename_only)
+
+
+
+@app.route('/keywords', methods=['GET'])
+def send_data():
+
+    global last_result
+    # last_result = json.dumps(last_result)
+
+    if last_result is None:
+        return jsonify({"error": "No data available"}), 400
+    return jsonify({"keywords": last_result}), 200
+
+
+@app.route('/history/project_title', methods=['GET'])
+def send_history_data():
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM project_folder")
+    result = cursor.fetchall()
+    cursor.close()
+    return jsonify({"History_data": result}), 200
+
+
+
+@app.route('/history/prompt_history', methods=['GET'])
+def get_prompt_history():
+    cursor = db.cursor()
+    try:
+        cursor.execute("SELECT prompt_id, prompt_text, project_id FROM prompt")
+        results = cursor.fetchall()
+
+        data = [
+            {"id": row[0], "prompt": row[1], "project_id": row[2]}
+            for row in results
+        ]
+
+        return jsonify({"History_data": data}), 200
+    except Exception as e:
+        print("Error fetching prompt history:", e)
+        return jsonify({"error": "DB fetch failed"}), 500
+    finally:
+        cursor.close()
+
+
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001)
+
+
+
+#####################
+
+
+
+
+
+
+
+
+
+
+
+# from flask import Flask, request, jsonify, send_from_directory
+# from flask_cors import CORS
+# from final_ranking import extract_text_from_db
+# from jd_generator1 import main_gpt
+# from pdf_extract import main_doc
+# import mysql.connector
+# import os
+# import json
+
+# app = Flask(__name__)
+# CORS(app)
+
+# # Global storage for result
+# last_result = None
+# project_id = None
+
+# # Set uploads folder relative to this file (inside back_end/uploads)
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # path to back_end folder
+# UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# # Database connection
+# db = mysql.connector.connect(
+#     host="localhost",
+#     port=3308,
+#     user="root",
+#     password="CVanalysis@123",
+#     database="resumes"
+# )
+# cursor = db.cursor()
+
+
+# @app.route('/prompt', methods=['POST'])
+# def receive_data():
+#     global last_result, project_id  # make sure to access the global project_id
+
+#     data = request.get_json()
+#     print("Received Data:", data)
+
+#     prompt_text = data.get('prompt')
+#     incoming_project_id = data.get('project_id')  # from frontend
+
+#     if not incoming_project_id:
+#         return jsonify({"error": "Missing project_id"}), 400
+
+#     # Handle "first_time" logic
+#     if incoming_project_id == 'first_time':
+#         current_project_id = project_id  # use the global project_id previously set
+#     else:
+#         current_project_id = int(incoming_project_id)  # use provided one
+
+#     # Get folder_id from DB
+#     cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (current_project_id,))
+#     result = cursor.fetchone()
+
+#     if result:
+#         folder_id = result[0]
+#     else:
+#         return jsonify({"error": "Project ID not found in database"}), 404
+
+#     # Call your GPT function with prompt and folder_id
+#     last_result = main_gpt(prompt_text, folder_id)
+#     print("Result:", last_result)
+
+#     last_result_json = json.dumps(last_result)
+
+#     try:
+#         cursor.execute(
+#             "INSERT INTO criteria (criteria, project_id) VALUES (%s, %s)",
+#             (last_result_json, current_project_id)
+#         )
+#         db.commit()
+#     except Exception as e:
+#         print(f"❌ DB insert failed: {e}")
+#         return jsonify({"error": "DB insert failed"}), 500
+
+#     return jsonify({"message": "Data received!", "data": data}), 200
+
+
+
+
+# @app.route('/send-data', methods=['POST'])
+# def received_data():
+#     data = request.get_json()
+#     print("Received Data:", data['Json'])
+#     return jsonify({"message": "Data received!"}), 200
+
+
+# @app.route('/send-pdf', methods=['POST'])
+# def upload_pdfs():
+
+#     global project_id  # Allow modifying global variable
+
+#     try:
+#         pdfs = request.files.getlist('pdfs')
+#         project_title = request.form.get('projectTitle')
+
+#         if not pdfs:
+#             return jsonify({"error": "No PDF files received."}), 400
+#         if not project_title:
+#             return jsonify({"error": "Project title is required."}), 400
+
+#         first_file = pdfs[0]
+#         relative_path = first_file.filename.replace("\\", "/")
+#         folder_name = relative_path.split('/')[0]
+#         root_folder = os.path.join(UPLOAD_FOLDER, folder_name)
+#         saved_files = []
+
+#         # ✅ Always ensure folder is in the database
+#         cursor.execute("SELECT folder_id FROM resume_folder WHERE folder_name = %s", (folder_name,))
+#         folder_result = cursor.fetchone()
+
+#         if folder_result:
+#             folder_id = folder_result[0]
+#         else:
+#             cursor.execute("INSERT INTO resume_folder (folder_name) VALUES (%s)", (folder_name,))
+#             db.commit()
+#             folder_id = cursor.lastrowid
+
+#         # ✅ Save PDFs (only if they aren't already saved)
+#         if not os.path.exists(root_folder):
+#             for file in pdfs:
+#                 if file.filename.endswith('.pdf'):
+#                     relative_path = file.filename.replace("\\", "/")
+#                     save_path = os.path.join(UPLOAD_FOLDER, relative_path)
+#                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+#                     file.save(save_path)
+#                     saved_files.append(relative_path)
+
+#             # Check if project_folder entry already exists for folder_id and project_title
+#             cursor.execute("SELECT project_id FROM project_folder WHERE folder_id = %s AND project_title = %s", (folder_id, project_title))
+#             existing_project = cursor.fetchone()
+#             if existing_project:
+#                 project_id = existing_project[0]
+#             else:
+#                 # Insert new project_folder entry
+#                 cursor.execute("INSERT INTO project_folder (project_title, folder_id) VALUES (%s, %s)", (project_title, folder_id))
+#                 db.commit()
+#                 project_id = cursor.lastrowid
+
+#             # ✅ Run resume parser
+#             print("[INFO] Running main_doc...")
+#             main_doc(root_folder, folder_id)
+#             print("[INFO] main_doc completed.")
+            
+#         else:
+#             print(f"[INFO] Root folder already exists: {root_folder}")
+
+#             # Check if project_folder entry already exists for folder_id and project_title
+#             cursor.execute("SELECT project_id FROM project_folder WHERE folder_id = %s AND project_title = %s", (folder_id, project_title))
+#             existing_project = cursor.fetchone()
+#             if existing_project:
+#                 project_id = existing_project[0]
+#             else:
+#                 # Insert new project_folder entry
+#                 cursor.execute("INSERT INTO project_folder (project_title, folder_id) VALUES (%s, %s)", (project_title, folder_id))
+#                 db.commit()
+#                 project_id = cursor.lastrowid
+
+
+#             for file in pdfs:
+#                 if file.filename.endswith('.pdf'):
+#                     relative_path = file.filename.replace("\\", "/")
+#                     saved_files.append(relative_path)
+
+#         return jsonify({
+#             "message": f"Received {len(saved_files)} PDFs for project '{project_title}'",
+#             "saved_files": saved_files,
+#             "project_id": project_id
+#         }), 200
+
+#     except mysql.connector.IntegrityError as err:
+#         if err.errno == mysql.connector.errorcode.ER_DUP_ENTRY:
+#             return jsonify({"error": f"Project title '{project_title}' already exists."}), 409
+#         else:
+#             print(f"Database IntegrityError: {err}")
+#             return jsonify({"error": "Database error."}), 500
+#     except Exception as e:
+#         print(f"Unexpected Error: {e}")
+#         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+
+
+
+
+# ranked_results_cache = []  # Store ranked results globally for later explanation
+
+
+# # @app.route('/rank-resumes', methods=['GET'])
+# # def rank_resumes():
+# #     global ranked_results_cache
+# #     if last_result is None:
+# #         return jsonify({"error": "Job criteria not available. Please submit prompt first."}), 400
+
+
+# #     # Get optional project_id
+# #     project_id = request.args.get('project_id')
+# #     ranked_results_cache = match_and_rank_resumes(last_result,project_id)
+# #     print("Ranked Results Cache:", ranked_results_cache)
+
+# #     return jsonify({"ranked": ranked_results_cache}), 200
+
+
+# @app.route('/rank-resumes', methods=['GET'])
+# def rank_resumes():
+#     global ranked_results_cache
+
+#     if last_result is None:
+#         return jsonify({"error": "Job criteria not available. Please submit prompt first."}), 400
+
+#     project_id = request.args.get('project_id')
+#     if not project_id:
+#         return jsonify({"error": "Missing project_id"}), 400
+
+#     # Ensure project_id is a valid integer
+#     try:
+#         project_id = int(project_id)
+#     except ValueError:
+#         return jsonify({"error": "Invalid project_id (must be an integer)"}), 400
+
+#     # Get folder_id from project_id
+#     cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (project_id,))
+#     folder_id_result = cursor.fetchone()
+#     if not folder_id_result:
+#         return jsonify({"error": "Invalid project_id"}), 404
+#     folder_id = folder_id_result[0]
+
+#     # Get folder_name from folder_id
+#     cursor.execute("SELECT folder_name FROM resume_folder WHERE folder_id = %s", (folder_id,))
+#     folder_name_result = cursor.fetchone()
+#     if not folder_name_result:
+#         return jsonify({"error": "Invalid folder_id"}), 404
+#     folder_name = folder_name_result[0]
+
+#     # Get ranking results and summaries
+#     ranked_results = extract_text_from_db(project_id)
+#     if not ranked_results:
+#         return jsonify({"error": "No ranked results found. Make sure resumes and criteria exist."}), 500
+
+
+#     filtered_results = []
+
+#     for item in ranked_results:
+#         source_file = item['source_file']
+#         folder_path = os.path.join(UPLOAD_FOLDER, folder_name)
+        
+#         # Create the relative path to the PDF (convert to URL-style path with forward slashes)
+#         relative_path = os.path.join(folder_name, source_file).replace(os.sep, '/')
+        
+#         # Final URL that your frontend (or user) can open
+#         pdf_path = f"http://localhost:5001/uploads/{relative_path}"
+
+#         # Add this URL to the item dictionary
+#         item['file_path'] = pdf_path
+
+#         filtered_results.append(item)
+
+
+#     # Optionally store in cache
+#     ranked_results_cache = filtered_results
+
+#     return jsonify({"ranked": filtered_results}), 200
+
+
+
+
+
+
+# @app.route('/list-pdfs', methods=['GET'])
+# def list_pdfs_by_folder():
+#     project_id = request.args.get('project_id')  # Get folder name from query param
+
+#     if not project_id:
+#         return jsonify({"error": "Missing folder_name parameter"}), 400
+    
+
+#     cursor.execute("SELECT folder_id FROM project_folder WHERE project_id = %s", (project_id,))
+#     folder_result = cursor.fetchone()
+
+#     if folder_result:
+#         folder_id = folder_result[0]
+
+#     cursor.execute("SELECT folder_name FROM resume_folder WHERE folder_id = %s", (folder_id,))
+#     folder_result = cursor.fetchone()
+
+#     if folder_result:
+#         folder_name = folder_result[0]
+
+#     folder_path = os.path.join(UPLOAD_FOLDER, folder_name)
+
+#     if not os.path.exists(folder_path):
+#         return jsonify({"error": f"Folder '{folder_name}' not found"}), 404
+
+#     pdf_files = []
+#     for root, _, files in os.walk(folder_path):
+#         for file in files:
+#             if file.endswith('.pdf'):
+#                 relative_path = os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER)
+#                 file_url = f"http://localhost:5001/uploads/{relative_path.replace(os.sep, '/')}"
+#                 pdf_files.append(file_url)
+
+
+    
+
+#     return jsonify({"pdfs": pdf_files}), 200
+
+
+
+# @app.route('/uploads/<path:filename>')
+# def serve_uploaded_file(filename):
+#     safe_filename = os.path.normpath(filename)
+
+#     # Split the filename into directory + file
+#     directory = os.path.join(UPLOAD_FOLDER, os.path.dirname(safe_filename))
+#     filename_only = os.path.basename(safe_filename)
+
+#     full_path = os.path.join(directory, filename_only)
+#     print(f"Requested filename: {filename}")
+#     print(f"Normalized filename: {safe_filename}")
+#     print(f"Serving from directory: {directory}")
+#     print(f"File only: {filename_only}")
+#     print(f"Full path on server: {full_path}")
+#     print(f"File exists? {os.path.exists(full_path)}")
+
+#     if not os.path.exists(full_path):
+#         return jsonify({"error": "File not found on server"}), 404
+
+#     return send_from_directory(directory, filename_only)
+
+
+
+# @app.route('/keywords', methods=['GET'])
+# def send_data():
+#     if last_result is None:
+#         return jsonify({"error": "No data available"}), 400
+#     return jsonify({"keywords": last_result}), 200
+
+
+# @app.route('/history/project_title', methods=['GET'])
+# def send_history_data():
+#     cursor.execute("SELECT * FROM project_folder")
+#     result = cursor.fetchall()
+
+#     return jsonify({"History_data": result}), 200
+
+
+# if __name__ == '__main__':
+#     app.run(host='0.0.0.0', port=5001)
+
