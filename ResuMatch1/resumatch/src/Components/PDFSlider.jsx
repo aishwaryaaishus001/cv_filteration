@@ -17,8 +17,7 @@ function PDFSlider() {
     4: "projects",
     5: "certification"
   };
-
-  const { projectId } = useParams();
+  const { projectId, promptId } = useParams();
   const { padding } = useOutletContext();
   const carouselRef = useRef(null);
   const dropdownRef = useRef(null);
@@ -43,7 +42,7 @@ function PDFSlider() {
   // Fetch ranked candidates from backend
   const fetchRankedCandidates = async () => {
     const response = await axios.get("http://localhost:5001/rank-resumes", {
-      params: { project_id: projectId }
+      params: { project_id: projectId , prompt_id: promptId }
     });
     return response.data.ranked;
   };

@@ -33,14 +33,16 @@ function JobDiscripPage() {
     }
   });
 
-  // const { data: historyData, isLoading, isError, error } = useQuery({
-  //   queryKey: ['prompt-history'],
-  //   queryFn: async () => {
-  //     const res = await axios.get("http://localhost:5001/history/prompt_history");
-  //     return res.data.History_data;
-  //   },
-  //   enabled: isDialogOpen, // only fetch when modal opens
-  // });
+  const { data: historyData, isLoading, isError, error } = useQuery({
+    queryKey: ['prompt-history', projectId], // include projectId in cache key
+    queryFn: async () => {
+      const res = await axios.get(
+        `http://localhost:5001/history/prompt_history?project_id=${projectId}`
+      );
+      return res.data.History_data;
+    },
+    enabled: isDialogOpen && !!projectId, // only fetch if modal is open and projectId exists
+  });
 
 
   function send() {
@@ -67,9 +69,10 @@ function JobDiscripPage() {
 
   
   console.log("Project ID:", projectId); // Log the projectId
+  console.log("History Data:", historyData); // Log the fetched history data
 
-  // if (isLoading) return <p>Loading...</p>;
-  // if (isError) return <p>{error.message}</p>;
+  if (isLoading) return <p>Loading...</p>;
+  if (isError) return <p>{error.message}</p>;
 
   return (
     <div className={`main-container ${padding}`}>
@@ -102,17 +105,17 @@ function JobDiscripPage() {
 
                   <div className='nav-item'>
                     <ul>
-                        {data.map((prompt, index) => (
+                        {historyData.map((prompt, index) => (
                           <li
                             key={prompt.id}
                             className={activeIndex === index ? 'active' : ''}
                             onClick={() => {
                               setActiveIndex(index);
-                              navigate(`/new/project/profile/${110}`);  // Navigate to dynamic route
+                              navigate(`/new/project/profile/${projectId}/${prompt.id}`);
                             }}
                           >
                             <a className={activeIndex === index ? 'active' : ''} href="#">
-                              {prompt.title}
+                              {prompt.prompt}
                             </a>
                           </li>
                         ))}

@@ -310,6 +310,8 @@ ranked_results_cache = []  # Store ranked results globally for later explanation
 @app.route('/rank-resumes', methods=['GET'])
 def rank_resumes():
     project_id = request.args.get('project_id')
+    prompt_id = request.args.get('prompt_id')
+
     if not project_id:
         return jsonify({"error": "Missing project_id"}), 400
 
@@ -330,8 +332,8 @@ def rank_resumes():
                    certifications_score, certifications_matches,
                    total_score, summary, file_path
             FROM ranked_resumes
-            WHERE project_id = %s
-        """, (project_id,))
+            WHERE project_id = %s and prompt_id = %s
+        """, (project_id, prompt_id))
         
         rows = cursor.fetchall()
         if not rows:
@@ -467,22 +469,28 @@ def send_history_data():
 
 @app.route('/history/prompt_history', methods=['GET'])
 def get_prompt_history():
+    project_id = request.args.get("project_id")  # Get it from query string
+
     cursor = db.cursor()
     try:
-        cursor.execute("SELECT prompt_id, prompt_text, project_id FROM prompt")
-        results = cursor.fetchall()
+        if project_id:
+            cursor.execute(
+                "SELECT prompt_id, prompt_text, project_id FROM prompt WHERE project_id = %s",
+                (project_id,)
+            )
 
+        results = cursor.fetchall()
         data = [
             {"id": row[0], "prompt": row[1], "project_id": row[2]}
             for row in results
         ]
-
         return jsonify({"History_data": data}), 200
     except Exception as e:
         print("Error fetching prompt history:", e)
         return jsonify({"error": "DB fetch failed"}), 500
     finally:
         cursor.close()
+
 
 
 

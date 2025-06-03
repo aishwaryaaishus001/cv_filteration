@@ -35,7 +35,7 @@ const router = createBrowserRouter([
           element: <PriorityPage />
         },
         {
-          path: "/new/project/profile/:projectId",
+          path: "/new/project/profile/:projectId/:promptId",
           element: <PDFSlider />
         },
         {

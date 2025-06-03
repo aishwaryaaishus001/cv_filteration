@@ -68,7 +68,7 @@ function PriorityPage() {
         mutate(formattedData, {
             onSuccess: (data) => {
                 console.log("Posted:", data);
-                navigate(`/new/project/profile/${projectId}`);
+                navigate(`/new/project/profile/${projectId}/${promptId}`);
             },
             onError: (error) => {
                 console.error("Error:", error);
